@@ -57,11 +57,23 @@ public class AlbumStoreLoadTest {
     private static AtomicLong successGetReviewRequests = new AtomicLong(0);
     private static AtomicLong failedGetReviewRequests = new AtomicLong(0);
 
+    // 专门用于3个GET/review线程的计数器
+    private static AtomicLong dedicatedGetReviewRequests = new AtomicLong(0);
+    private static AtomicLong dedicatedSuccessGetReviewRequests = new AtomicLong(0);
+    private static AtomicLong dedicatedFailedGetReviewRequests = new AtomicLong(0);
+
+    // 专门用于记录3个GET/review线程的开始和结束时间
+    private static long dedicatedGetReviewStartTime;
+    private static long dedicatedGetReviewEndTime;
+
     // Lists to store response times for statistics
     private static List<Long> postAlbumResponseTimes = Collections.synchronizedList(new ArrayList<>());
     private static List<Long> postReviewResponseTimes = Collections.synchronizedList(new ArrayList<>());
     private static List<Long> getAlbumResponseTimes = Collections.synchronizedList(new ArrayList<>());
     private static List<Long> getReviewResponseTimes = Collections.synchronizedList(new ArrayList<>());
+
+    // 专门用于3个GET/review线程的响应时间列表
+    private static List<Long> dedicatedGetReviewResponseTimes = Collections.synchronizedList(new ArrayList<>());
 
     // Flag to control GET/review threads
     private static AtomicBoolean keepRunning = new AtomicBoolean(true);
@@ -105,6 +117,10 @@ public class AlbumStoreLoadTest {
         ExecutorService mainExecutor = Executors.newCachedThreadPool();
         CountDownLatch mainLatch = new CountDownLatch(threadGroupSize * numThreadGroups);
 
+        // 创建专用的CountDownLatch来协调3个GET/review线程
+        CountDownLatch getReviewLatch = new CountDownLatch(3);
+        ExecutorService getReviewExecutor = null;
+
         // Launch thread groups with delay
         for (int group = 0; group < numThreadGroups; group++) {
             System.out.println("Launching thread group " + (group + 1) + " of " + numThreadGroups);
@@ -122,16 +138,20 @@ public class AlbumStoreLoadTest {
             // Start the GET/review threads after the first group completes
             if (group == 0) {
                 System.out.println("Launching GET/review background threads...");
-                ExecutorService getReviewExecutor = Executors.newFixedThreadPool(3);
+                getReviewExecutor = Executors.newFixedThreadPool(3);
+
+                // 记录这3个线程的开始时间
+                dedicatedGetReviewStartTime = System.currentTimeMillis();
 
                 for (int i = 0; i < 3; i++) {
                     getReviewExecutor.submit(() -> {
-                        runGetReviewThread(baseUrl);
+                        try {
+                            runDedicatedGetReviewThread(baseUrl);
+                        } finally {
+                            getReviewLatch.countDown();
+                        }
                     });
                 }
-
-                // This executor will be shutdown when all main test threads complete
-                getReviewExecutor.shutdown();
             }
 
             // Wait for the delay before starting the next group (if not the last group)
@@ -148,9 +168,20 @@ public class AlbumStoreLoadTest {
         // Signal GET/review threads to stop
         keepRunning.set(false);
 
-        // Shutdown the main executor
+        // 等待3个GET/review线程完成并记录结束时间
+        getReviewLatch.await();
+        dedicatedGetReviewEndTime = System.currentTimeMillis();
+
+        // Shutdown the main executor and GET/review executor
         mainExecutor.shutdown();
+        if (getReviewExecutor != null) {
+            getReviewExecutor.shutdown();
+        }
+
         mainExecutor.awaitTermination(5, TimeUnit.MINUTES);
+        if (getReviewExecutor != null) {
+            getReviewExecutor.awaitTermination(5, TimeUnit.MINUTES);
+        }
 
         long endTime = System.currentTimeMillis();
 
@@ -274,6 +305,38 @@ public class AlbumStoreLoadTest {
 
             } catch (Exception e) {
                 System.err.println("Error in GET/review thread: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 专用于3个GET/review线程的方法，使用单独的计数器
+     */
+    private static void runDedicatedGetReviewThread(String baseUrl) {
+        Random random = new Random();
+
+        while (keepRunning.get()) {
+            try {
+                // Get a random album ID from the queue if available
+                String albumId = null;
+                if (!albumIdQueue.isEmpty()) {
+                    // Get a random ID from the queue
+                    Object[] ids = albumIdQueue.toArray();
+                    if (ids.length > 0) {
+                        albumId = (String) ids[random.nextInt(ids.length)];
+                    }
+                }
+
+                // If no album ID is available, use a fallback
+                if (albumId == null || albumId.isEmpty()) {
+                    continue;
+                }
+
+                // Send GET/review request with dedicated counters
+                getDedicatedReviewStats(baseUrl, albumId);
+
+            } catch (Exception e) {
+                System.err.println("Error in dedicated GET/review thread: " + e.getMessage());
             }
         }
     }
@@ -541,6 +604,79 @@ public class AlbumStoreLoadTest {
     }
 
     /**
+     * 专用于3个GET/review线程的getReviewStats方法，使用单独的计数器
+     */
+    private static void getDedicatedReviewStats(String baseUrl, String albumId) {
+        long startTime = System.currentTimeMillis();
+
+        for (int retry = 0; retry < MAX_RETRIES; retry++) {
+            CloseableHttpClient httpClient = HttpClients.createDefault();
+
+            try {
+                HttpGet httpGet = new HttpGet(baseUrl + "review/" + albumId);
+
+                // 使用专用计数器
+                dedicatedGetReviewRequests.incrementAndGet();
+                // 同时也增加总计数器以便保持一致性
+                totalGetReviewRequests.incrementAndGet();
+
+                try (CloseableHttpResponse response = httpClient.execute(httpGet)) {
+                    int statusCode = response.getStatusLine().getStatusCode();
+
+                    // Calculate and record response time
+                    long endTime = System.currentTimeMillis();
+                    long latency = endTime - startTime;
+
+                    // 记录到两个响应时间列表
+                    dedicatedGetReviewResponseTimes.add(latency);
+                    getReviewResponseTimes.add(latency);
+
+                    if (statusCode == 200) {
+                        // 使用专用成功计数器
+                        dedicatedSuccessGetReviewRequests.incrementAndGet();
+                        // 也增加总成功计数器
+                        successGetReviewRequests.incrementAndGet();
+                        return;
+                    } else if (statusCode >= 400 && statusCode < 600) {
+                        // Retry for 4XX or 5XX errors
+                        if (retry < MAX_RETRIES - 1) {
+                            System.err.println("Retrying dedicated get review stats after error " + statusCode + ", attempt " + (retry + 1));
+                            continue;
+                        } else {
+                            // 使用专用失败计数器
+                            dedicatedFailedGetReviewRequests.incrementAndGet();
+                            // 也增加总失败计数器
+                            failedGetReviewRequests.incrementAndGet();
+                            System.err.println("Failed to get dedicated review stats after " + MAX_RETRIES + " attempts, status code: " + statusCode);
+                        }
+                    } else {
+                        dedicatedSuccessGetReviewRequests.incrementAndGet();
+                        successGetReviewRequests.incrementAndGet();
+                    }
+                }
+
+                // If we got here without returning, break the retry loop
+                break;
+
+            } catch (Exception e) {
+                if (retry < MAX_RETRIES - 1) {
+                    System.err.println("Retrying dedicated get review stats after exception: " + e.getMessage() + ", attempt " + (retry + 1));
+                } else {
+                    dedicatedFailedGetReviewRequests.incrementAndGet();
+                    failedGetReviewRequests.incrementAndGet();
+                    System.err.println("Exception while getting dedicated review stats after " + MAX_RETRIES + " attempts: " + e.getMessage());
+                }
+            } finally {
+                try {
+                    httpClient.close();
+                } catch (IOException e) {
+                    System.err.println("Exception while closing HTTP client: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
      * Print test results including statistics
      */
     private static void printTestResults(long startTime, long endTime) {
@@ -586,6 +722,18 @@ public class AlbumStoreLoadTest {
         System.out.println("POST Review Latency (ms): " + calculateStatistics(postReviewResponseTimes));
         System.out.println("GET Album Latency (ms): " + calculateStatistics(getAlbumResponseTimes));
         System.out.println("GET Review Latency (ms): " + calculateStatistics(getReviewResponseTimes));
+
+        // 计算3个专用GET/review线程的wall time和吞吐量
+        double dedicatedWallTime = (dedicatedGetReviewEndTime - dedicatedGetReviewStartTime) / 1000.0;
+        double dedicatedThroughput = dedicatedGetReviewRequests.get() / dedicatedWallTime;
+
+        System.out.println("\n======== DEDICATED GET/REVIEW THREADS STATISTICS ========");
+        System.out.println("Dedicated GET/Review Wall Time: " + dedicatedWallTime + " seconds");
+        System.out.println("Dedicated GET/Review Requests: " + dedicatedGetReviewRequests.get() +
+                " (Success: " + dedicatedSuccessGetReviewRequests.get() +
+                ", Failed: " + dedicatedFailedGetReviewRequests.get() + ")");
+        System.out.println("Dedicated GET/Review Throughput: " + String.format("%.2f", dedicatedThroughput) + " requests/second");
+        System.out.println("Dedicated GET/Review Latency (ms): " + calculateStatistics(dedicatedGetReviewResponseTimes));
     }
 
     /**
